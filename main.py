@@ -3,33 +3,27 @@ import uuid
 import logging
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from pytube import YouTube
 import ffmpeg
+import re
+from urllib.parse import urlparse, parse_qs
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Efficient YouTube Video Downloader and Converter")
+app = FastAPI(title="Improved YouTube Video Downloader with Multiple Resolution Support")
 
 # Constants
 DOWNLOAD_DIR = "downloaded_videos"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-RESOLUTIONS = {
-    "240p": "426x240",
-    "360p": "640x360",
-    "480p": "854x480",
-    "720p": "1280x720",
-    "1080p": "1920x1080",
-    "1440p": "2560x1440",
-    "2160p": "3840x2160",
-}
+RESOLUTIONS = ["2160p", "1080p", "720p", "480p"]
 
 # Models
 class DownloadRequest(BaseModel):
-    url: str
+    url: HttpUrl
     resolution: str
 
 class DownloadStatus(BaseModel):
@@ -43,51 +37,88 @@ download_tasks = {}
 
 # Helper functions
 def safe_filename(filename):
-    return "".join([c for c in filename if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+    return re.sub(r'[^\w\-_\. ]', '_', filename)
 
-async def download_and_convert_video(task_id: str, url: str, resolution: str):
+def get_video_id(url):
+    # Parse the URL to extract video ID
+    parsed_url = urlparse(url)
+    
+    if parsed_url.hostname in ["www.youtube.com", "youtube.com"]:
+        query_params = parse_qs(parsed_url.query)
+        if "v" in query_params:
+            return query_params["v"][0]  # Extract video ID from 'v' parameter
+    elif parsed_url.hostname == "youtu.be":
+        return parsed_url.path[1:]  # Extract video ID from short URL
+    return None
+
+async def download_and_process_video(task_id: str, url: str, target_resolution: str):
     task = download_tasks[task_id]
     task.status = "Downloading"
     
     try:
         logger.info(f"Starting download for task {task_id}: {url}")
-        # Download video
-        yt = YouTube(url)
-        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+        video_id = get_video_id(url)
+        if not video_id:
+            raise ValueError("Invalid YouTube URL")
+        
+        yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
+        safe_title = safe_filename(yt.title)
+        
+        # Get the highest resolution stream
+        stream = yt.streams.filter(progressive=False, file_extension="mp4").order_by("resolution").desc().first()
         
         if not stream:
             raise Exception("No suitable video stream found")
         
-        safe_title = safe_filename(yt.title)
-        original_file = os.path.join(DOWNLOAD_DIR, f"{task_id}_{safe_title}_original.mp4")
-        stream.download(output_path=DOWNLOAD_DIR, filename=original_file)
+        logger.info(f"Downloading video: {stream.resolution}")
+        video_file = os.path.join(DOWNLOAD_DIR, f"{task_id}_{safe_title}_video.mp4")
+        stream.download(output_path=DOWNLOAD_DIR, filename=video_file)
         
-        logger.info(f"Download completed for task {task_id}. Starting conversion.")
-        task.status = "Converting"
+        # Download audio separately
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        if not audio_stream:
+            raise Exception("No audio stream found")
         
-        # Convert video
-        if resolution not in RESOLUTIONS:
-            raise Exception(f"Invalid resolution: {resolution}")
+        logger.info("Downloading audio")
+        audio_file = os.path.join(DOWNLOAD_DIR, f"{task_id}_{safe_title}_audio.mp4")
+        audio_stream.download(output_path=DOWNLOAD_DIR, filename=audio_file)
         
-        output_file = os.path.join(DOWNLOAD_DIR, f"{task_id}_{safe_title}_{resolution}.mp4")
+        logger.info(f"Download completed for task {task_id}. Starting processing.")
+        task.status = "Processing"
         
+        # Process video
+        output_file = os.path.join(DOWNLOAD_DIR, f"{task_id}_{safe_title}_{target_resolution}.mp4")
+        
+        if target_resolution == "2160p":
+            target_size = "3840x2160"
+        elif target_resolution == "1080p":
+            target_size = "1920x1080"
+        elif target_resolution == "720p":
+            target_size = "1280x720"
+        elif target_resolution == "480p":
+            target_size = "854x480"
+        else:
+            raise ValueError(f"Invalid resolution: {target_resolution}")
+        
+        logger.info(f"Processing video to {target_resolution}")
         (
             ffmpeg
-            .input(original_file)
-            .filter("scale", size=RESOLUTIONS[resolution], force_original_aspect_ratio="decrease")
-            .output(output_file, vcodec="libx264", acodec="aac", video_bitrate="1000k", audio_bitrate="128k")
+            .input(video_file)
+            .output(output_file, vf=f"scale={target_size}:force_original_aspect_ratio=decrease,pad={target_size}:-1:-1:color=black", 
+                    acodec="copy", vcodec="libx264", preset="medium")
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True)
         )
         
-        # Clean up original file
-        os.remove(original_file)
+        # Clean up temporary files
+        os.remove(video_file)
+        os.remove(audio_file)
         
-        logger.info(f"Conversion completed for task {task_id}.")
+        logger.info(f"Processing completed for task {task_id}.")
         task.status = "Completed"
         task.filename = os.path.basename(output_file)
     except Exception as e:
-        logger.error(f"Error in task {task_id}: {str(e)}")
+        logger.error(f"Error in task {task_id}: {str(e)}", exc_info=True)
         task.status = "Failed"
         task.error = str(e)
 
@@ -95,15 +126,18 @@ async def download_and_convert_video(task_id: str, url: str, resolution: str):
 @app.post("/download")
 async def request_download(request: DownloadRequest, background_tasks: BackgroundTasks):
     try:
+        if request.resolution not in RESOLUTIONS:
+            raise HTTPException(status_code=400, detail=f"Invalid resolution. Supported resolutions are: {', '.join(RESOLUTIONS)}")
+        
         task_id = str(uuid.uuid4())
         download_tasks[task_id] = DownloadStatus(task_id=task_id, status="Queued")
         
         logger.info(f"New download request: {request.url}, Resolution: {request.resolution}")
-        background_tasks.add_task(download_and_convert_video, task_id, request.url, request.resolution)
+        background_tasks.add_task(download_and_process_video, task_id, str(request.url), request.resolution)
         
         return JSONResponse(content={"task_id": task_id, "message": "Download request accepted"})
     except Exception as e:
-        logger.error(f"Error in request_download: {str(e)}")
+        logger.error(f"Error in request_download: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/status/{task_id}")
